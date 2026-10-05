@@ -255,11 +255,15 @@ const KIND_META = {
   decline: ['🚫', '婉拒'], reject_reschedule: ['↩️', '拒绝改期'], cancel: ['❌', '取消'],
   resume: ['🔄', '重新协商'], rebook: ['📅', '缺席后重约'], complete: ['🎉', '面试完成'],
   crisis_suspend: ['🛡️', '危机挂起'], crisis_resume: ['🛡️', '危机重约恢复'],
+  reject_cancel: ['⛔', '流程淘汰取消'],
   noshow: ['⚠️', '缺席裁定'], auto_noshow: ['🤖', '系统初判缺席'],
   remind24h: ['⏰', '24小时提醒'], remind1h: ['🔔', '1小时提醒'], remind: ['📣', '手动提醒'],
   system: ['ℹ️', '系统']
 }
 const PARTY_LABEL = { candidate: '候选人方', interviewer: '面试官', recruiter: '招聘负责人', system: '系统' }
+
+// 应聘流程终态（已淘汰/已录用）：协商操作由服务端拦截，前端同步隐藏操作按钮并给出指引
+const appTerminal = computed(() => ['rejected', 'hired'].includes(detail.value?.app_stage))
 </script>
 
 <template>
@@ -453,6 +457,9 @@ const PARTY_LABEL = { candidate: '候选人方', interviewer: '面试官', recru
         <div class="crisis-banner" v-if="detail.crisis_suspended">
           🛡️ 该预约因关联危机事件的流程回退被同步挂起，时段已释放；可在本单<b>重新协商</b>恢复，双方确认后面试流程继续，恢复动作会写入危机审计链。
         </div>
+        <div class="terminal-banner" v-if="appTerminal">
+          ⛔ 该候选人流程已{{ detail.app_stage === 'rejected' ? '淘汰' : '录用' }}，预约协商已终止；如需继续请先在「🔄 招聘流程」异常回退复活流程，之后可在本单重新协商。
+        </div>
 
         <!-- 时间与确认位 -->
         <div class="d-timecard" :class="{ resch: detail.status === 'rescheduling' }">
@@ -480,8 +487,9 @@ const PARTY_LABEL = { candidate: '候选人方', interviewer: '面试官', recru
           <span class="muted" v-if="detail.checkin_flagged">系统于结束 15 分钟后初判，招聘负责人可改判或安排重约。</span>
         </div>
 
-        <!-- 操作区（按角色/状态） -->
+        <!-- 操作区（按角色/状态）；流程终态时隐藏协商操作，由服务端终态防护兜底 -->
         <div class="d-acts acts">
+          <template v-if="!appTerminal">
           <template v-if="['negotiating','rescheduling'].includes(detail.status)">
             <!-- 面试官确认 -->
             <button v-if="store.myRole === 'interviewer' && detail.interviewer_id === store.currentUser?.id && !detail.int_confirmed"
@@ -527,6 +535,7 @@ const PARTY_LABEL = { candidate: '候选人方', interviewer: '面试官', recru
             <button class="primary" :disabled="store.myRole === 'hiring_manager'" @click="openResume">
               {{ detail.crisis_suspended ? '🛡️ 在原单重约，恢复面试流程' : '↻ 在本单上重新协商' }}
             </button>
+          </template>
           </template>
 
           <button class="ghost" @click="detailId = null">关闭</button>
@@ -656,6 +665,7 @@ const PARTY_LABEL = { candidate: '候选人方', interviewer: '面试官', recru
 .crisis-flag.big { font-size: 12px; margin-left: 10px; padding: 2px 10px; }
 .crisis-banner { font-size: 12.5px; line-height: 1.7; color: var(--purple); background: rgba(167,139,250,.08); border: 1px solid rgba(167,139,250,.35); border-radius: 10px; padding: 9px 13px; }
 .crisis-banner b { color: var(--purple); }
+.terminal-banner { font-size: 12.5px; line-height: 1.7; color: var(--red); background: rgba(255,107,122,.07); border: 1px solid rgba(255,107,122,.4); border-radius: 10px; padding: 9px 13px; margin-bottom: 12px; }
 .ac-time { font-size: 15px; display: flex; gap: 7px; align-items: center; }
 .ac-time .old { text-decoration: line-through; color: var(--muted); }
 .newtime { font-size: 12px; color: var(--accent2); }

@@ -47,6 +47,7 @@ const notifyIcon = {
   sched_declined: '🚫', sched_cancelled: '❌', sched_completed: '🎉',
   sched_noshow: '⚠️', sched_rebooked: '🔄',
   sched_remind_24h: '⏰', sched_remind_1h: '🔔', sched_remind: '📣',
+  stage_rejected: '⛔',
   onb_profile_started: '📋', onb_submitted: '🧳', onb_resubmitted: '🔁',
   onb_returned: '↩️', onb_approved: '✅', onb_checkin: '🏢',
   onb_noshow: '⚠️', onb_completed: '🎉', onb_cancelled: '🚫'
@@ -63,12 +64,13 @@ function toggleNotify() {
 function readAll() {
   store.markNotificationsRead()
 }
-// 点击通知跳转到对应中心并关闭面板：危机类 → 危机审计，预约类 → 预约沟通，其余 → 审批中心
+// 点击通知跳转到对应中心并关闭面板：危机类 → 危机审计，预约类 → 预约沟通，流程阶段类 → 招聘流程，其余 → 审批中心
 function openNotify(n) {
   showNotify.value = false
   if (String(n?.type || '').startsWith('crisis_')) view.value = 'crisis'
   else if (String(n?.type || '').startsWith('sched_')) view.value = 'schedule'
   else if (String(n?.type || '').startsWith('onb_')) view.value = 'onboarding'
+  else if (String(n?.type || '').startsWith('stage_')) view.value = 'pipeline'
   else view.value = 'approval'
 }
 

@@ -185,6 +185,50 @@ export function suspendAppointmentsForIncident(applicationId, { incidentId, acto
   return suspended
 }
 
+// ---------------- 流程淘汰联动：取消进行中的面试预约 ----------------
+// 在主流程事务内调用（面试结论不通过/直接淘汰/Offer 拒绝）：negotiating/confirmed/rescheduling
+// 一律置 cancelled，清空待确认提议与提醒幂等位、释放双方时段占用、同步 interviews 表并追加协商留痕；
+// 不直接发通知（由调用方归并失效未读后统一投递）。流程复活后可在原单「重新协商」恢复。返回被取消清单。
+export function cancelAppointmentsForStage(applicationId, { actor, reason }) {
+  const appId = num(applicationId)
+  const rows = db.prepare(`SELECT * FROM appointments
+                           WHERE application_id=? AND status IN ('negotiating','confirmed','rescheduling')
+                           ORDER BY id`).all(appId)
+  const stamp = ts()
+  const cancelled = rows.map(appt => ({
+    id: appt.id, round: appt.round, status: appt.status,
+    start_at: appt.start_at, end_at: appt.end_at,
+    status_label: STATUS_LABEL[appt.status] || appt.status,
+    interviewer_id: appt.interviewer_id, interviewer_name: appt.interviewer_name
+  }))
+  rows.forEach(appt => {
+    db.prepare(`UPDATE appointments SET status='cancelled',final_result='cancelled',
+                pending_start='',pending_end='',pending_format='',pending_location='',pending_by_party='',
+                cand_confirmed=0,int_confirmed=0,reminded_24h=0,reminded_1h=0,checkin_flagged=0,
+                completed_at=?,updated_at=?,version=version+1 WHERE id=?`)
+      .run(stamp, stamp, appt.id)
+    releaseSlots(appt.id)
+    syncInterview({ ...appt, start_at: appt.start_at }, { cancelled: true, label: '流程淘汰：预约已取消' })
+    addMessage(appt.id, {
+      kind: 'reject_cancel', party: 'system',
+      actor: actor || { id: 'system', name: '系统' },
+      start: appt.status === 'rescheduling' ? (appt.pending_start || appt.start_at) : appt.start_at,
+      end: appt.status === 'rescheduling' ? (appt.pending_end || appt.end_at) : appt.end_at,
+      content: `招聘流程已淘汰，进行中预约同步取消，时段已释放；原因：${reason}（流程复活后可在本单重新协商）`
+    })
+  })
+  return cancelled
+}
+
+// 流程终态防护：应聘已淘汰/已录用时，预约协商（确认/改期/重约/完成/缺席/提醒）一律拒绝，
+// 避免「流程已终态但协商仍在继续」的悬挂待办；复活/回退到在途阶段后自动恢复可协商
+function assertAppSchedulable(appt) {
+  const a = db.prepare('SELECT stage FROM applications WHERE id=?').get(appt.application_id)
+  if (!a) notFound('应聘记录不存在', 'app_missing')
+  if (a.stage === 'rejected') conflict('候选人流程已淘汰，预约协商已终止；如需继续请先「异常回退」复活流程', 'terminal_locked')
+  if (a.stage === 'hired') conflict('候选人已录用，无需再进行面试预约协商', 'terminal_locked')
+}
+
 // ---------------- 权限：解析「代候选人操作」的一方 ----------------
 // 招聘负责人可代候选人（默认）或代面试官（电话确认后）操作；面试官只能代表本人
 function resolveParty(user, body = {}, { allowRecruiter = false } = {}) {
@@ -479,6 +523,7 @@ router.post('/appointments/:id/confirm', wrap((req, res) => {
   const b = req.body || {}
   const out = tx(() => {
     const appt = getAppt(num(req.params.id))
+    assertAppSchedulable(appt)
     if (!['negotiating', 'rescheduling'].includes(appt.status)) conflict('当前状态无需确认', 'status_not_pending')
     const party = resolveParty(user, b)
     assertActorOnAppt(user, appt, party)
@@ -518,6 +563,7 @@ router.post('/appointments/:id/propose', wrap((req, res) => {
   const b = req.body || {}
   const out = tx(() => {
     const appt = getAppt(num(req.params.id))
+    assertAppSchedulable(appt)
     if (!['negotiating', 'confirmed', 'rescheduling'].includes(appt.status)) {
       conflict('当前状态不能改期；缺席/取消后请使用「重新预约」', 'status_no_reschedule')
     }
@@ -568,6 +614,7 @@ router.post('/appointments/:id/reject-reschedule', wrap((req, res) => {
   const b = req.body || {}
   const out = tx(() => {
     const appt = getAppt(num(req.params.id))
+    assertAppSchedulable(appt)
     if (appt.status !== 'rescheduling') conflict('仅改期协商中的预约可以拒绝改期', 'not_rescheduling')
     const party = resolveParty(user, b)
     assertActorOnAppt(user, appt, party)
@@ -600,6 +647,7 @@ router.post('/appointments/:id/decline', wrap((req, res) => {
   const b = req.body || {}
   const out = tx(() => {
     const appt = getAppt(num(req.params.id))
+    assertAppSchedulable(appt)
     if (!['negotiating', 'rescheduling'].includes(appt.status)) conflict('仅协商中的预约可以婉拒', 'status_not_pending')
     const party = resolveParty(user, b)
     assertActorOnAppt(user, appt, party)
@@ -626,6 +674,7 @@ router.post('/appointments/:id/cancel', wrap((req, res) => {
   const b = req.body || {}
   const out = tx(() => {
     const appt = getAppt(num(req.params.id))
+    assertAppSchedulable(appt)
     if (appt.status !== 'confirmed') conflict('仅已确认的预约可以取消；协商中可婉拒', 'not_confirmed')
     if (user.role === 'hiring_manager') forbidden('用人经理不能取消预约', 'role_not_allowed')
     if (user.role === 'interviewer' && String(appt.interviewer_id) !== String(user.id)) forbidden('只能取消本人的预约', 'not_your_appointment')
@@ -653,6 +702,7 @@ router.post('/appointments/:id/resume', wrap((req, res) => {
   const b = req.body || {}
   const out = tx(() => {
     const appt = getAppt(num(req.params.id))
+    assertAppSchedulable(appt)
     if (!['declined', 'cancelled'].includes(appt.status)) conflict('仅婉拒/取消的预约可以重新协商', 'not_resumable')
     if (user.role === 'hiring_manager') forbidden('用人经理不能重启预约', 'role_not_allowed')
     if (user.role === 'interviewer' && String(appt.interviewer_id) !== String(user.id)) forbidden('只能处理分配给您本人的预约', 'not_your_appointment')
@@ -719,6 +769,7 @@ router.post('/appointments/:id/rebook', wrap((req, res) => {
   const b = req.body || {}
   const out = tx(() => {
     const appt = getAppt(num(req.params.id))
+    assertAppSchedulable(appt)
     if (appt.status !== 'no_show') conflict('仅缺席未到的预约可以重新约期', 'not_no_show')
     if (user.role === 'hiring_manager') forbidden('用人经理不能重新约期', 'role_not_allowed')
     if (user.role === 'interviewer' && String(appt.interviewer_id) !== String(user.id)) forbidden('只能处理本人的预约', 'not_your_appointment')
@@ -760,6 +811,7 @@ router.post('/appointments/:id/complete', wrap((req, res) => {
   const user = currentUser(req)
   const out = tx(() => {
     const appt = getAppt(num(req.params.id))
+    assertAppSchedulable(appt)
     if (appt.status !== 'confirmed') conflict('仅已确认的预约可以标记完成', 'not_confirmed')
     if (user.role === 'hiring_manager') forbidden('用人经理不能标记完成', 'role_not_allowed')
     if (user.role === 'interviewer' && String(appt.interviewer_id) !== String(user.id)) forbidden('只能处理本人的预约', 'not_your_appointment')
@@ -802,6 +854,7 @@ router.post('/appointments/:id/noshow', wrap((req, res) => {
   const b = req.body || {}
   const out = tx(() => {
     const appt = getAppt(num(req.params.id))
+    assertAppSchedulable(appt)
     if (!['confirmed', 'no_show'].includes(appt.status)) conflict('仅已确认/已初判缺席的预约可以裁定缺席', 'not_confirmed')
     if (user.role !== 'recruiter') forbidden('缺席裁定需由招聘负责人处理', 'role_not_allowed')
     adjudicateNoShow(appt, { result: String(b.result || ''), note: String(b.note || ''), actor: user })
@@ -815,6 +868,7 @@ router.post('/appointments/:id/remind', wrap((req, res) => {
   const user = currentUser(req)
   const out = tx(() => {
     const appt = getAppt(num(req.params.id))
+    assertAppSchedulable(appt)
     if (appt.status !== 'confirmed') conflict('仅已确认的预约可以发送提醒', 'not_confirmed')
     if (user.role === 'hiring_manager') forbidden('用人经理不发送提醒', 'role_not_allowed')
     addMessage(appt.id, { kind: 'remind', party: user.role === 'interviewer' ? 'interviewer' : 'recruiter', actor: user, start: appt.start_at, content: '手动发送了会前提醒' })
@@ -870,3 +924,24 @@ router.get('/sweep', wrap((req, res) => {
   })
   res.json({ ok: true, ...result, swept_at: ts() })
 }))
+
+// ---------------- 历史兼容：清理「流程已终态但预约仍进行中」的遗留预约 ----------------
+// 淘汰联动上线前的旧数据可能残留「应用已淘汰/已录用但预约仍协商中/已确认」的悬挂单，
+// 启动时静默取消并释放时段（写系统留痕、不发通知），保证红点/待办口径与流程终态一致
+function migrateOrphanAppointments() {
+  const appIds = db.prepare(`SELECT DISTINCT application_id FROM appointments
+                             WHERE status IN ('negotiating','confirmed','rescheduling')
+                               AND application_id IN (SELECT id FROM applications WHERE stage IN ('rejected','hired'))`).all()
+  if (!appIds.length) return
+  let count = 0
+  tx(() => {
+    appIds.forEach(r => {
+      count += cancelAppointmentsForStage(r.application_id, {
+        actor: { id: 'system', name: '系统迁移' },
+        reason: '历史数据迁移：流程已终态，遗留预约同步取消'
+      }).length
+    })
+  })
+  if (count) console.log(`[schedule] migrated ${count} orphan appointments to cancelled`)
+}
+migrateOrphanAppointments()
