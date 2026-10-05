@@ -45,8 +45,9 @@ const notifyIcon = {
   sched_proposed: '📨', sched_partial: '✅', sched_confirmed: '📅',
   sched_reschedule_request: '🔁', sched_reschedule_rejected: '↩️',
   sched_declined: '🚫', sched_cancelled: '❌', sched_completed: '🎉',
-  sched_noshow: '⚠️', sched_rebooked: '🔄',
+  sched_noshow: '⚠️', sched_rebooked: '🔄', sched_appt_suspended: '⏸️',
   sched_remind_24h: '⏰', sched_remind_1h: '🔔', sched_remind: '📣',
+  task_auto_cancelled: '⏸️',
   onb_profile_started: '📋', onb_submitted: '🧳', onb_resubmitted: '🔁',
   onb_returned: '↩️', onb_approved: '✅', onb_checkin: '🏢',
   onb_noshow: '⚠️', onb_completed: '🎉', onb_cancelled: '🚫'

@@ -150,11 +150,11 @@ function syncInterview(appt, { cancelled = false, label = '' } = {}) {
   }
 }
 
-// ---------------- 危机回退同步：挂起进行中的面试预约 ----------------
-// 在危机模块事务内调用：negotiating/confirmed/rescheduling 一律置为 cancelled 并打 crisis_suspended 标记，
-// 清空待确认提议与提醒幂等位、释放双方时段占用、同步 interviews 表并追加协商留痕；
-// 不直接发通知（通知由危机模块统一投递并关联事件/责任人）。返回被挂起的预约清单供上链。
-export function suspendAppointmentsForIncident(applicationId, { incidentId, actor, reason }) {
+// ---------------- 流程终态同步：挂起进行中的面试预约 ----------------
+// 内部共用实现（危机处置/面试淘汰两条路径）：negotiating/confirmed/rescheduling 一律置为 cancelled
+// 并打下来源标记（markSql 片段），清空待确认提议与提醒幂等位、释放双方时段占用、
+// 同步 interviews 表并追加协商留痕；不直接发通知（通知由调用方统一投递）。返回被挂起的预约清单。
+function suspendActiveAppointments(applicationId, { actor, kind, label, content, markSql, markVals = [] }) {
   const appId = num(applicationId)
   const rows = db.prepare(`SELECT * FROM appointments
                            WHERE application_id=? AND status IN ('negotiating','confirmed','rescheduling')
@@ -170,19 +170,47 @@ export function suspendAppointmentsForIncident(applicationId, { incidentId, acto
     db.prepare(`UPDATE appointments SET status='cancelled',final_result='cancelled',
                 pending_start='',pending_end='',pending_format='',pending_location='',pending_by_party='',
                 cand_confirmed=0,int_confirmed=0,reminded_24h=0,reminded_1h=0,checkin_flagged=0,
-                crisis_suspended=1,incident_id=?,completed_at=?,updated_at=?,version=version+1 WHERE id=?`)
-      .run(num(incidentId), stamp, stamp, appt.id)
+                ${markSql},completed_at=?,updated_at=?,version=version+1 WHERE id=?`)
+      .run(...markVals, stamp, stamp, appt.id)
     releaseSlots(appt.id)
-    syncInterview({ ...appt, start_at: appt.start_at }, { cancelled: true, label: '危机处置：预约已挂起' })
+    syncInterview({ ...appt, start_at: appt.start_at }, { cancelled: true, label })
     addMessage(appt.id, {
-      kind: 'crisis_suspend', party: 'system',
+      kind, party: 'system',
       actor: actor || { id: 'system', name: '系统' },
       start: appt.status === 'rescheduling' ? (appt.pending_start || appt.start_at) : appt.start_at,
       end: appt.status === 'rescheduling' ? (appt.pending_end || appt.end_at) : appt.end_at,
-      content: `危机事件处置：进行中预约同步挂起，时段已释放；原因：${reason}（可在本单重新协商恢复）`
+      content
     })
   })
   return suspended
+}
+
+// 危机回退同步：在危机模块事务内调用，打 crisis_suspended 标记并保留来源事件；
+// 之后可在原单上「重新协商」恢复（恢复动作由危机模块上链）
+export function suspendAppointmentsForIncident(applicationId, { incidentId, actor, reason }) {
+  return suspendActiveAppointments(applicationId, {
+    actor, kind: 'crisis_suspend', label: '危机处置：预约已挂起',
+    content: `危机事件处置：进行中预约同步挂起，时段已释放；原因：${reason}（可在本单重新协商恢复）`,
+    markSql: 'crisis_suspended=1,incident_id=?', markVals: [num(incidentId)]
+  })
+}
+
+// 面试结论不通过/流程淘汰同步：在淘汰事务内调用，打 reject_suspended 标记；
+// 改判结论复活流程后，可在原单上「重新协商」恢复后续面试安排
+export function suspendAppointmentsForRejection(applicationId, { actor, reason } = {}) {
+  return suspendActiveAppointments(applicationId, {
+    actor, kind: 'reject_suspend', label: '流程淘汰：预约已挂起',
+    content: `面试流程已淘汰：进行中预约同步挂起，时段已释放；原因：${reason || '面试结论不通过'}（改判复活后可在本单重新协商）`,
+    markSql: 'reject_suspended=1'
+  })
+}
+
+// 协商/恢复类操作的流程终态守卫：应聘已淘汰或已录用时，预约协商不得继续或重启
+// （淘汰联动会把进行中预约挂起，此处兜底并发缝隙与历史残留，保证终态口径一致）
+function assertAppNegotiable(applicationId) {
+  const a = db.prepare('SELECT stage FROM applications WHERE id=?').get(num(applicationId))
+  if (a?.stage === 'rejected') conflict('该候选人流程已淘汰，请先改判结论/复活流程后再协商', 'terminal_locked')
+  if (a?.stage === 'hired') conflict('该候选人已录用，无需再进行面试预约协商', 'terminal_locked')
 }
 
 // ---------------- 权限：解析「代候选人操作」的一方 ----------------
@@ -235,6 +263,7 @@ export function getScheduleState() {
       reminded_1h: !!a.reminded_1h,
       checkin_flagged: !!a.checkin_flagged,
       crisis_suspended: !!a.crisis_suspended,
+      reject_suspended: !!a.reject_suspended,
       incident_id: num(a.incident_id),
       candidate: ctx?.candidate_name || '',
       position: ctx?.position_name || '',
@@ -480,6 +509,7 @@ router.post('/appointments/:id/confirm', wrap((req, res) => {
   const out = tx(() => {
     const appt = getAppt(num(req.params.id))
     if (!['negotiating', 'rescheduling'].includes(appt.status)) conflict('当前状态无需确认', 'status_not_pending')
+    assertAppNegotiable(appt.application_id)
     const party = resolveParty(user, b)
     assertActorOnAppt(user, appt, party)
     const targetTime = appt.status === 'rescheduling' ? appt.pending_start : appt.start_at
@@ -521,6 +551,7 @@ router.post('/appointments/:id/propose', wrap((req, res) => {
     if (!['negotiating', 'confirmed', 'rescheduling'].includes(appt.status)) {
       conflict('当前状态不能改期；缺席/取消后请使用「重新预约」', 'status_no_reschedule')
     }
+    assertAppNegotiable(appt.application_id)
     const party = resolveParty(user, b)
     assertActorOnAppt(user, appt, party)
     const { start, end } = readInterval(b)
@@ -656,6 +687,8 @@ router.post('/appointments/:id/resume', wrap((req, res) => {
     if (!['declined', 'cancelled'].includes(appt.status)) conflict('仅婉拒/取消的预约可以重新协商', 'not_resumable')
     if (user.role === 'hiring_manager') forbidden('用人经理不能重启预约', 'role_not_allowed')
     if (user.role === 'interviewer' && String(appt.interviewer_id) !== String(user.id)) forbidden('只能处理分配给您本人的预约', 'not_your_appointment')
+    // 淘汰挂起的预约须等流程复活（改判结论）后再重启协商；录用终态同理拦截
+    assertAppNegotiable(appt.application_id)
     const wasCrisisSuspended = !!appt.crisis_suspended
     const crisisIncidentId = num(appt.incident_id)
     const { start, end } = readInterval(b)
@@ -672,7 +705,7 @@ router.post('/appointments/:id/resume', wrap((req, res) => {
     const confirmed = candBit && intBit
     db.prepare(`UPDATE appointments SET status=?,start_at=?,end_at=?,pending_start='',pending_end='',pending_format='',pending_location='',
                 pending_by_party='',cand_confirmed=?,int_confirmed=?,final_result='',checkin_flagged=0,reminded_24h=0,reminded_1h=0,
-                crisis_suspended=0,
+                crisis_suspended=0,reject_suspended=0,
                 format=COALESCE(NULLIF(?, ''),format),location=COALESCE(NULLIF(?, ''),location),
                 confirmed_at=?,completed_at='',updated_at=?,version=version+1 WHERE id=?`)
       .run(confirmed ? 'confirmed' : 'negotiating', start, end, candBit, intBit,
@@ -722,6 +755,8 @@ router.post('/appointments/:id/rebook', wrap((req, res) => {
     if (appt.status !== 'no_show') conflict('仅缺席未到的预约可以重新约期', 'not_no_show')
     if (user.role === 'hiring_manager') forbidden('用人经理不能重新约期', 'role_not_allowed')
     if (user.role === 'interviewer' && String(appt.interviewer_id) !== String(user.id)) forbidden('只能处理本人的预约', 'not_your_appointment')
+    // 缺席重约同样受流程终态约束：淘汰/录用后须先复活流程
+    assertAppNegotiable(appt.application_id)
     const { start, end } = readInterval(b)
     assertNoConflict({ applicationId: appt.application_id, interviewerId: appt.interviewer_id, start, end, excludeApptId: appt.id })
     const party = resolveParty(user, b)

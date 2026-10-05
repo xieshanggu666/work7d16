@@ -125,7 +125,7 @@ function passAndAdvance(a) {
             <textarea v-model="iv.eval" placeholder="填写面试评价……" rows="2" @change="saveEval(iv)"></textarea>
             <div class="muted" v-if="iv.id === lastInterview(detail)?.id">
               {{ conclusionOf(iv) === 'fail'
-                ? '最近一轮结论为「不通过」：应聘已自动淘汰；如属误判，改回通过即可复活。'
+                ? '最近一轮结论为「不通过」：应聘已自动淘汰，进行中预约已挂起、遗留待审已撤销；如属误判，改回通过即可复活并在原单重约。'
                 : conclusionOf(iv) === 'pass'
                   ? '最近一轮结论为「通过」：可提请推进到 Offer 阶段（用人经理审批）。'
                   : '这是最后一轮评价，「通过/不通过」结论需提交审批，由招聘负责人审批后生效。' }}

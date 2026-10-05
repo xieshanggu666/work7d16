@@ -81,7 +81,7 @@ npm run dev     # 同时启动后端(4160) 与 前端 Vite
 | `crisis_tickets` | 危机处置工单（责任到人，创建/改派/流转均上链并回写通知责任人） |
 | `crisis_reports` | 危机复盘报告（草稿可改，定稿强制校验哈希链并固化从审计链汇总的责任矩阵；定稿后不可改） |
 | `schedule_slots` | 面试官/候选人**可用时段池**（`owner_type` 归属方、`source=self/recruiter` 本人维护或 HR 代录、`open/used` 状态与占用预约联动） |
-| `appointments` | 双向预约单（协商状态机 `negotiating/confirmed/rescheduling/declined/completed/no_show/cancelled` + 双方确认位 `cand_confirmed/int_confirmed` + 改期提议 `pending_*` + 提醒幂等位 + `crisis_suspended/incident_id` 危机回退挂起标记） |
+| `appointments` | 双向预约单（协商状态机 `negotiating/confirmed/rescheduling/declined/completed/no_show/cancelled` + 双方确认位 `cand_confirmed/int_confirmed` + 改期提议 `pending_*` + 提醒幂等位 + `crisis_suspended/incident_id` 危机回退挂起标记 + `reject_suspended` 淘汰挂起标记） |
 | `appointment_messages` | 预约沟通留痕（发起/确认/改期/拒绝改期/婉拒/取消/提醒/缺席裁定/重约，只追加，形成协商时间线） |
 | `onboardings` | 入职交接主单（四阶段 `profile/approval/checkin/handover` + `done/cancelled` 终态；资料快照、材料清单、审批、报到、试用事项、乐观锁 `version`；进行中交接单同一应聘部分唯一索引） |
 | `onboarding_events` | 入职交接留痕（发起/资料更新/候选人确认/提交/通过/退回/重提/报到/未报到/交接事项/完成/撤销/系统中止/补录，只追加不改写） |
@@ -95,6 +95,7 @@ npm run dev     # 同时启动后端(4160) 与 前端 Vite
 - **确认改期**：已确认预约任一方可发起改期（**原因必填**），进入「改期协商中」：原时间保留、新提议放入 `pending_*` 并重置双方确认位，双方再次确认后新时间生效；任一方可**拒绝改期**，预约自动回到已确认并维持原时间。协商中也可「婉拒本轮」，之后可在原单上「重新协商」（历史时间线保留）。
 - **提醒**：页面顶部「同步提醒/缺席扫描」（`GET /api/schedule/sweep`，幂等）自动扫描——开始前 **24 小时**与 **1 小时**分别向面试官、招聘负责人（转达候选人）投递提醒，时间线写入 `remind24h/remind1h`；也可在详情里**立即手动提醒**。
 - **缺席处理**：结束 **15 分钟宽限期**后仍处已确认（未标记完成）的预约，sweep **系统初判候选人缺席**（`auto_noshow`，可改判）；招聘负责人可裁定/改判为候选人缺席、面试官缺席、双方缺席，缺席后支持**保留缺席记录重新约期**（`rebook`，对方确认后成立）。
+- **淘汰联动挂起**：面试结论判定「不通过」（含审批终审执行）或招聘负责人主动淘汰时，在**同一事务**内同步处置在途协同——① 进行中（待确认/改期中/已确认）预约**挂起**（置 `cancelled` 并打 `reject_suspended` 标记、清空确认位与提醒幂等位、释放双方时段、同步 `interviews` 表、追加协商留痕）；② 撤销该应聘全部**待审批任务**并补写 `cancel` 留痕（终审执行中的任务自身除外，退回态保留）；③ 已失效的预约（`sched_*`）/审批（`task_*`）未读通知**归并已读**，清除铃铛与红点残留，随后投递联动结果通知。改判复活（或异常回退复活）后，可在挂起预约**原单上重新协商**恢复；淘汰/录用终态下确认、改期、重协、缺席重约一律 409 拦截。
 - **API**：`POST /api/schedule/slots|slots/bulk`、`DELETE …/slots/:id`、`POST /api/schedule/appointments`、`…/:id/confirm|propose|reject-reschedule|decline|cancel|resume|rebook|complete|noshow|remind`、`GET /api/schedule/sweep`；预约通知（`sched_*`）点击铃铛直达预约沟通页，导航红点显示待当前身份处理的协商数。
 
 ## 候选人入职交接（🧳 入职交接）
@@ -160,7 +161,7 @@ npm run dev     # 同时启动后端(4160) 与 前端 Vite
 投递→筛选→面试→Offer→录用/入职的每次状态变更都由服务端统一的状态机驱动，并在**同一 SQLite 事务**内完成「应用阶段 + 乐观锁版本 + 阶段快照 + 阶段事件 + Offer 留痕」的同步，保证看板、面试、Offer、追溯、报表五处口径一致：
 
 - **阶段推进约束**：只能沿顺序前进；进入 Offer 前最近一轮面试结论必须为「通过」（无面试/待定/不通过均拦截并提示）；Offer→录用只能由「接受 Offer」驱动，不能跳过候选人确认。
-- **面试结论协同**：最近一轮结论置「不通过」自动淘汰（记录淘汰来源 `reject_from`）；淘汰态下改判「通过/待定」可复活回面试阶段。录用后结论锁定，重复提交同一结论按幂等处理。
+- **面试结论协同**：最近一轮结论置「不通过」自动淘汰（记录淘汰来源 `reject_from`），并在同事务联动挂起进行中预约、撤销待审批任务、归并失效未读通知（见「预约沟通·淘汰联动挂起」）；淘汰态下改判「通过/待定」可复活回面试阶段，挂起预约在原单重约恢复。录用后结论锁定，重复提交同一结论按幂等处理（不重复触发联动）。
 - **Offer 变更约束**：仅允许 待回应→接受/拒绝/撤回、已接受→入职/撤回；接受后或终态下禁止改薪（仅待回应可调薪/改期），每次变更追加 `offer_change_logs`。候选人拒绝 Offer 自动淘汰；撤回进行中 Offer、或从录用异常回退时，Offer 同步撤回。被撤回/拒绝的 Offer 可在原记录上重新发起（保留历史）。
 - **异常回退**：每个阶段可回退到上一阶段（录用→Offer→面试→筛选→投递），写 `rollback` 事件并以当前最新分刷新该阶段快照；淘汰记录按 `reject_from` 复活。投递阶段不可再退。
 - **重复操作保护**：`applications.version` 乐观锁——前端携带读取时的版本，重复点击/并发/过期页面提交返回 409 `version_conflict` 并自动刷新；同键操作在前端串行化（按钮置灰），服务端对重复投递、重复发起待回应 Offer、终态操作、非法状态跳跃一律 4xx 拒绝。

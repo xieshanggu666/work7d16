@@ -527,6 +527,10 @@ addColumn('offers', 'joined_at', `TEXT NOT NULL DEFAULT ''`)
 addColumn('appointments', 'crisis_suspended', `INTEGER NOT NULL DEFAULT 0`)
 addColumn('appointments', 'incident_id', `INTEGER NOT NULL DEFAULT 0`)
 
+// 面试结论不通过/流程淘汰同步：进行中的预约被挂起（status 复用 cancelled，reject_suspended=1 标记），
+// 改判复活后可在原单上「重新协商」恢复；与 crisis_suspended 并列记录挂起来源
+addColumn('appointments', 'reject_suspended', `INTEGER NOT NULL DEFAULT 0`)
+
 // 危机处置审计模块：通知表补齐「责任回写」列（旧库升级）
 addColumn('notifications', 'incident_id', `INTEGER NOT NULL DEFAULT 0`)
 addColumn('notifications', 'ticket_id', `INTEGER NOT NULL DEFAULT 0`)

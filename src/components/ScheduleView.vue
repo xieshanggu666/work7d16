@@ -255,6 +255,7 @@ const KIND_META = {
   decline: ['🚫', '婉拒'], reject_reschedule: ['↩️', '拒绝改期'], cancel: ['❌', '取消'],
   resume: ['🔄', '重新协商'], rebook: ['📅', '缺席后重约'], complete: ['🎉', '面试完成'],
   crisis_suspend: ['🛡️', '危机挂起'], crisis_resume: ['🛡️', '危机重约恢复'],
+  reject_suspend: ['⏸️', '淘汰挂起'],
   noshow: ['⚠️', '缺席裁定'], auto_noshow: ['🤖', '系统初判缺席'],
   remind24h: ['⏰', '24小时提醒'], remind1h: ['🔔', '1小时提醒'], remind: ['📣', '手动提醒'],
   system: ['ℹ️', '系统']
@@ -304,6 +305,7 @@ const PARTY_LABEL = { candidate: '候选人方', interviewer: '面试官', recru
             <span class="round-tag">{{ a.round }}</span>
             <span class="st" :class="statusClass(a.status)">{{ a.status_label }}</span>
             <em v-if="a.crisis_suspended" class="crisis-flag" @click.stop>🛡️ 危机挂起</em>
+            <em v-else-if="a.reject_suspended" class="reject-flag" @click.stop>⏸️ 淘汰挂起</em>
             <em v-else-if="minePending(a)" class="mine-flag">待我处理</em>
           </div>
           <div class="ac-time">
@@ -449,9 +451,13 @@ const PARTY_LABEL = { candidate: '候选人方', interviewer: '面试官', recru
           <span class="round-tag">{{ detail.round }}</span>
           <span class="st" :class="statusClass(detail.status)">{{ detail.status_label }}</span>
           <span v-if="detail.crisis_suspended" class="crisis-flag big">🛡️ 危机处置挂起</span>
+          <span v-else-if="detail.reject_suspended" class="reject-flag big">⏸️ 流程淘汰挂起</span>
         </h3>
         <div class="crisis-banner" v-if="detail.crisis_suspended">
           🛡️ 该预约因关联危机事件的流程回退被同步挂起，时段已释放；可在本单<b>重新协商</b>恢复，双方确认后面试流程继续，恢复动作会写入危机审计链。
+        </div>
+        <div class="reject-banner" v-else-if="detail.reject_suspended">
+          ⏸️ 该预约因面试结论不通过、流程淘汰被同步挂起，时段已释放；{{ detail.app_stage === 'rejected' ? '需先在面试管理<b>改判结论</b>复活流程，之后' : '流程已复活，' }}可在本单<b>重新协商</b>恢复后续面试安排。
         </div>
 
         <!-- 时间与确认位 -->
@@ -524,7 +530,9 @@ const PARTY_LABEL = { candidate: '候选人方', interviewer: '面试官', recru
           </template>
 
           <template v-if="['declined','cancelled'].includes(detail.status)">
-            <button class="primary" :disabled="store.myRole === 'hiring_manager'" @click="openResume">
+            <button class="primary" :disabled="store.myRole === 'hiring_manager' || (detail.reject_suspended && detail.app_stage === 'rejected')"
+              :title="detail.reject_suspended && detail.app_stage === 'rejected' ? '流程仍处淘汰态：请先在面试管理改判结论复活流程' : ''"
+              @click="openResume">
               {{ detail.crisis_suspended ? '🛡️ 在原单重约，恢复面试流程' : '↻ 在本单上重新协商' }}
             </button>
           </template>
@@ -656,6 +664,10 @@ const PARTY_LABEL = { candidate: '候选人方', interviewer: '面试官', recru
 .crisis-flag.big { font-size: 12px; margin-left: 10px; padding: 2px 10px; }
 .crisis-banner { font-size: 12.5px; line-height: 1.7; color: var(--purple); background: rgba(167,139,250,.08); border: 1px solid rgba(167,139,250,.35); border-radius: 10px; padding: 9px 13px; }
 .crisis-banner b { color: var(--purple); }
+.reject-flag { margin-left: auto; font-style: normal; font-size: 10px; font-weight: 700; color: var(--red); background: rgba(248,113,113,.12); border: 1px solid rgba(248,113,113,.45); border-radius: 9px; padding: 1px 8px; }
+.reject-flag.big { font-size: 12px; margin-left: 10px; padding: 2px 10px; }
+.reject-banner { font-size: 12.5px; line-height: 1.7; color: var(--red); background: rgba(248,113,113,.07); border: 1px solid rgba(248,113,113,.3); border-radius: 10px; padding: 9px 13px; }
+.reject-banner b { color: var(--red); }
 .ac-time { font-size: 15px; display: flex; gap: 7px; align-items: center; }
 .ac-time .old { text-decoration: line-through; color: var(--muted); }
 .newtime { font-size: 12px; color: var(--accent2); }

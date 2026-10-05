@@ -3,7 +3,7 @@ import db, { ts, now, DEFAULT_WEIGHTS, DEFAULT_KEYWORD_CAP } from './db.js'
 import {
   router as crisisRouter, bindCrisisCore, auditPassive, getCrisisState
 } from './crisis.js'
-import { router as scheduleRouter, getScheduleState } from './schedule.js'
+import { router as scheduleRouter, getScheduleState, suspendAppointmentsForRejection } from './schedule.js'
 import {
   router as onboardingRouter, bindOnboardingCore, cancelOnboardingForApp, getOnboardingState
 } from './onboarding.js'
@@ -863,13 +863,15 @@ app.post('/api/applications/:id/reject', (req, res, next) => {
         operator: b.operator, fromStage
       })
       db.prepare('UPDATE applications SET reject_from=? WHERE id=?').run(fromStage, id)
+      // 与「面试结论不通过」同一套淘汰联动：预约挂起 / 待审撤销 / 失效通知归并（同事务）
+      const linkage = coordinateRejectionLinkage(a, { operator: b.operator, reason: b.reason || '招聘负责人淘汰' })
       auditPassive({
         category: 'action', action: 'state.reject', actor, applicationId: id,
         refType: 'application', refId: id,
         summary: `危机相关流程淘汰：${STAGE_LABEL[fromStage] || fromStage} → 淘汰`,
         detail: { from: fromStage, to: 'rejected', reason: b.reason || '' }
       })
-      return { ok: true, stage: 'rejected', from: fromStage, version: a.version, snapshot: r.snapshot }
+      return { ok: true, stage: 'rejected', from: fromStage, version: a.version, snapshot: r.snapshot, linkage }
     })
     if (out.notFound) return res.status(404).json({ ok: false, code: 'not_found' })
     res.json(out)
@@ -925,10 +927,73 @@ app.post('/api/applications/:id/interview', (req, res, next) => {
   } catch (e) { next(e) }
 })
 
+// ---------------- 淘汰联动：预约挂起 + 待审撤销 + 通知归并 ----------------
+// 面试结论不通过（或主动淘汰）使应聘进入淘汰态时，在同一事务内同步处置在途协同：
+// ① 进行中的面试预约挂起（schedule 模块：释放时段/同步 interviews/追加协商留痕，可在原单重约恢复）
+// ② 撤销该应聘全部「待审批」任务（申请前提已失效，退回态保留由申请人自行处置），补写 cancel 留痕
+// ③ 已失效的预约（sched_*）/审批（task_*）未读通知归并为已读，清除铃铛与红点残留
+// ④ 投递联动结果通知（在③之后，作为新消息保留未读）
+// excludeTaskId：审批终审执行淘汰结论时，正在执行的任务自身不参与撤销（由审批流程正常结案）
+function coordinateRejectionLinkage(a, { operator, reason = '', excludeTaskId = 0 } = {}) {
+  const why = reason || '面试结论不通过'
+  const actor = { id: '', name: operator || a.recruiter || 'HR-Sandy', role: 'recruiter' }
+
+  // ① 进行中预约挂起（reject_suspended 标记；改判复活后可在原单重新协商）
+  const suspended = suspendAppointmentsForRejection(a.id, { actor, reason: why })
+
+  // ② 待审批任务同步撤销（审批链/步骤留痕与业务淘汰同一事务提交）
+  const stamp = ts()
+  const cancelledTasks = []
+  db.prepare("SELECT * FROM approval_tasks WHERE application_id=? AND status='pending' ORDER BY id").all(a.id)
+    .filter(t => num(t.id) !== num(excludeTaskId))
+    .forEach(t => {
+      db.prepare("UPDATE approval_tasks SET status='cancelled', decided_at=?, decide_note=?, version=version+1 WHERE id=?")
+        .run(stamp, `流程淘汰同步撤销：${why}`, t.id)
+      addStep(t.id, {
+        stepNo: num(t.current_step), role: '', action: 'cancel',
+        actor: actor.name, note: `流程淘汰自动撤销待审任务：${why}`
+      })
+      cancelledTasks.push(t)
+    })
+
+  // ③ 失效未读通知归并：协商/审批待办已随淘汰失效，直接已读避免铃铛与红点残留
+  const stale = db.prepare(`SELECT id FROM notifications
+                            WHERE application_id=? AND is_read=0
+                              AND (type LIKE 'sched_%' OR type LIKE 'task_%')`).all(a.id)
+  if (stale.length) {
+    const marks = stale.map(() => '?').join(',')
+    db.prepare(`UPDATE notifications SET is_read=1 WHERE id IN (${marks})`).run(...stale.map(r => r.id))
+  }
+
+  // ④ 联动结果通知：预约双方角色汇总一条；每个被撤销任务按申请人角色单独告知
+  if (suspended.length) {
+    ;['recruiter', 'interviewer'].forEach(role => notify({
+      recipientRole: role, type: 'sched_appt_suspended',
+      title: '面试预约已随流程淘汰挂起',
+      body: `因${why}，该候选人 ${suspended.length} 个进行中预约已挂起并释放时段；改判复活后可在原单重新协商`,
+      appId: a.id
+    }))
+  }
+  cancelledTasks.forEach(t => {
+    const meta = TASK_TYPES[t.type]
+    notify({
+      recipientRole: t.submitted_role, type: 'task_auto_cancelled',
+      title: `${meta?.label || '审批'}申请已随流程淘汰撤销`,
+      body: `「${meta?.label || t.type}」申请 #${t.id} 因${why}、流程淘汰被同步撤销，复活流程后可重新发起`,
+      taskId: t.id, appId: a.id
+    })
+  })
+  return {
+    appointments_suspended: suspended.length,
+    tasks_cancelled: cancelledTasks.map(t => t.id),
+    notifications_read: stale.length
+  }
+}
+
 // 面试结论协同核心：双写 conclusion/result 并记录决定人；最近一轮「不通过」自动淘汰，
 // 淘汰态改判「通过/待定」复活回面试阶段；录用后锁定，同结论幂等。
 // 供「面试更新端点」与「面试结论审批通过后的执行回写」共用
-function applyInterviewConclusion(iv, a, conclusion, { operator } = {}) {
+function applyInterviewConclusion(iv, a, conclusion, { operator, excludeTaskId = 0 } = {}) {
   const current = iv.conclusion || iv.result || 'pending'
   if (a.stage === 'hired' && conclusion !== current) {
     conflict('候选人已录用，面试结论已锁定', 'terminal_locked')
@@ -937,21 +1002,25 @@ function applyInterviewConclusion(iv, a, conclusion, { operator } = {}) {
   const stamp = ts()
   db.prepare('UPDATE interviews SET conclusion=?, result=?, decided_at=?, decided_by=? WHERE id=?')
     .run(conclusion, conclusion, stamp, operator || a.recruiter || 'HR-Sandy', iv.id)
-  // 最近一轮给出「不通过」结论：应聘自动淘汰并固化阶段事件（仅对最近一轮生效，历史轮次改判不联动）
+  // 最近一轮给出「不通过」结论：应聘自动淘汰并固化阶段事件（仅对最近一轮生效，历史轮次改判不联动），
+  // 同一事务内联动处置在途协同：预约挂起 / 待审撤销 / 失效通知归并
   const last = latestInterviewOf(a.id)
+  let linkage = null
   if (conclusion === 'fail' && last && last.id === iv.id && a.stage !== 'rejected') {
     const fromStage = a.stage
     moveStage(a, 'rejected', { eventType: 'reject', operator, fromStage })
     db.prepare('UPDATE applications SET reject_from=? WHERE id=?').run(fromStage, a.id)
+    linkage = coordinateRejectionLinkage(a, { operator, reason: '面试结论不通过', excludeTaskId })
   }
-  // 淘汰状态下「改判通过/待定」可复活：回到面试阶段（单步回退，避免跨阶段跳变）
+  // 淘汰状态下「改判通过/待定」可复活：回到面试阶段（单步回退，避免跨阶段跳变）；
+  // 挂起的预约保留在原单（reject_suspended 标记），由双方在预约沟通页重新协商恢复
   if (conclusion !== 'fail' && a.stage === 'rejected') {
     const target = a.reject_from && STAGES.includes(a.reject_from) && STAGES.indexOf(a.reject_from) <= STAGES.indexOf('interview')
       ? a.reject_from : 'interview'
     moveStage(a, target, { eventType: 'rollback', operator, fromStage: 'rejected' })
     db.prepare("UPDATE applications SET reject_from='' WHERE id=?").run(a.id)
   }
-  return { idempotent: false, version: a.version }
+  return { idempotent: false, version: a.version, ...(linkage ? { linkage } : {}) }
 }
 
 // 更新面试评价/结论。结论(pass/fail/pending)与 result 双写兼容；同一结论重复提交直接幂等返回
@@ -1147,7 +1216,8 @@ function executeApprovalTask(task, actor) {
   if (task.type === 'interview_conclusion') {
     const iv = db.prepare('SELECT * FROM interviews WHERE id=?').get(num(payload.interview_id))
     if (!iv || iv.application_id !== a.id) badRequest('关联面试记录不存在', 'interview_missing')
-    applyInterviewConclusion(iv, a, payload.conclusion, { operator: actor.name })
+    // 终审执行淘汰结论时，本任务不参与「待审同步撤销」（由审批流程自身结案）
+    applyInterviewConclusion(iv, a, payload.conclusion, { operator: actor.name, excludeTaskId: task.id })
     return { desc: `「${iv.round}」面试结论已生效：${payload.conclusion === 'pass' ? '通过' : '不通过'}`, version: a.version }
   }
   if (task.type === 'offer_issue') {
